@@ -13,7 +13,7 @@ Querying the web interface of the device to monitor:
 - Spanning tree (RSTP)
 - Link aggregation (LAG)
 
-Issues and source [https://github.com/tofkamp/checkmk\_swos/issues](https://github.com/tofkamp/checkmk_swos)
+Issues and source [https://github.com/tofkamp/checkmk\_swos](https://github.com/tofkamp/checkmk_swos)
 
 Compatibility SWoS/Release
 |       | v2.18 | v2.19 |   |   |
@@ -24,7 +24,9 @@ Compatibility SWoS/Release
 Tested on the following routers:
 - CRS354-48P-4S+2Q+
 - CRS326-24S+2Q+
+
 If you tested the monitoring on another device type, please report this.
+
 ---
 ## Checkmk agent plugin for MikroTik SwOS switches
 ```
