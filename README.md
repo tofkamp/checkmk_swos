@@ -18,7 +18,7 @@ Querying the web interface of the device to monitor:
 Install the `.mkp` file via **Setup → Extension packages** or via the CLI:
 
 ```
-mkp install mikrotik-<version>.mkp
+mkp install swos-<version>.mkp
 ```
 
 After installation, configure the special agent under
