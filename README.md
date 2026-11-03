@@ -13,6 +13,18 @@ Querying the web interface of the device to monitor:
 - Spanning tree (RSTP)
 - Link aggregation (LAG)
 
+### Installation
+
+Install the `.mkp` file via **Setup → Extension packages** or via the CLI:
+
+```
+mkp install mikrotik-<version>.mkp
+```
+
+After installation, configure the special agent under
+**Setup → Other integrations → MikroTik SwOS** and assign it to your
+MikroTik hosts.
+
 Issues and source [https://github.com/tofkamp/checkmk\_swos](https://github.com/tofkamp/checkmk_swos)
 
 Compatibility SWoS/Release
