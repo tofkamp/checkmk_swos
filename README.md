@@ -22,8 +22,8 @@ Compatibility SWoS/Release
 |       |       |       |   |   |
 |       |       |       |   |   |
 ---
-Checkmk agent plugin for MikroTik SwOS switches.
-
+## Checkmk agent plugin for MikroTik SwOS switches
+```
 Polls ONE SwOS switch per run over HTTP (digest auth) and prints the result as
 Checkmk <<<local>>> checks. Optionally the output is wrapped as piggyback data
 for another host name (--piggyback / SWOS_PIGGYBACK).
@@ -63,4 +63,5 @@ SWOS_PASSWORD still works for standalone use.
 Test:    SWOS_HOST=192.168.88.2 SWOS_PASSWORD=secret ./agent_swos
          ./agent_swos --host 192.168.88.2 --user admin --expected-up 1,49
          ./agent_swos --host 192.168.88.2 --dump       raw decoded pages
-         
+
+```
