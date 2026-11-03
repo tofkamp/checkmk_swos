@@ -13,9 +13,9 @@ Querying the web interface of the device to monitor:
 - Spanning tree (RSTP)
 - Link aggregation (LAG)
 
-Issues [https://github.com/tofkamp/checkmk\_swos/issues](https://github.com/tofkamp/checkmk_swos/issues)
+Issues and source [https://github.com/tofkamp/checkmk\_swos/issues](https://github.com/tofkamp/checkmk_swos)
 
-Compatibility SWos/Release
+Compatibility SWoS/Release
 |       | v2.18 | v2.19 |   |   |
 |-------|-------|-------|---|---|
 | 1.0.0 | &#x2713; |   &#x2713;   |   |   |
