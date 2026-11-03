@@ -1,7 +1,7 @@
-# checkmk_swos
-CheckMK special Agent to monitor Mikrotik SWoS throught web requests
+Monitor Mikrotik SWos routers
 
-Features
+Querying the web interface of the device to monitor:
+
 - System information and uptime
 - Temperatures
 - Fans
@@ -13,4 +13,8 @@ Features
 - Spanning tree (RSTP)
 - Link aggregation (LAG)
 
+Issues [https://github.com/tofkamp/checkmk\_swos/issues](https://github.com/tofkamp/checkmk_swos/issues)
 
+Compatibility SWos/Release
+\| \| v.2.18\| v 2.19\|
+\| 1.0.0\| v\|v\|
