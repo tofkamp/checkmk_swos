@@ -21,6 +21,10 @@ Compatibility SWoS/Release
 | 1.0.0 | &#x2713; |   &#x2713;   |   |   |
 |       |       |       |   |   |
 |       |       |       |   |   |
+
+Tested on the following routers:
+- CRS354-48P-4S+2Q+
+- CRS326-24S+2Q+
 ---
 ## Checkmk agent plugin for MikroTik SwOS switches
 ```
