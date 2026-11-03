@@ -16,5 +16,8 @@ Querying the web interface of the device to monitor:
 Issues [https://github.com/tofkamp/checkmk\_swos/issues](https://github.com/tofkamp/checkmk_swos/issues)
 
 Compatibility SWos/Release
-\| \| v.2.18\| v 2.19\|
-\| 1.0.0\| v\|v\|
+|       | v2.18 | v2.19 |   |   |
+|-------|-------|-------|---|---|
+| 1.0.0 | &#x2713; |   &#x2713;   |   |   |
+|       |       |       |   |   |
+|       |       |       |   |   |
