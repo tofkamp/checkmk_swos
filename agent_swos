@@ -1,0 +1,1050 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Checkmk agent plugin for MikroTik SwOS switches.
+
+Polls ONE SwOS switch per run over HTTP (digest auth) and prints the result as
+Checkmk <<<local>>> checks. Optionally the output is wrapped as piggyback data
+for another host name (--piggyback / SWOS_PIGGYBACK).
+Only dependency: the Python "requests" module.
+
+Runs as a Checkmk special agent (plug-in family "swos": this file belongs in
+libexec/agent_swos, see rulesets/ and server_side_calls/) or standalone.
+
+Services (field names/scales were taken from the web UI JavaScript
+of a real CRS354-48P-4S+2Q+ running SwOS 2.18):
+
+  SwOS System         identity, model, version, serial, MAC, IP, build, uptime
+  SwOS Temp <sensor>  CPU / board 1 / board 2 / PHY temperature
+  SwOS Fan <n>        fan RPM
+  SwOS PSU <n>        status, voltage, current, power, temperature
+  SwOS Port NN        link, speed, duplex, flow control, RSTP role/state, LAG,
+                      PoE, traffic rates, packet rates, errors
+  SwOS SFP NN         module info + DDM (temperature, voltage, bias, Tx/Rx dBm)
+  SwOS PoE Total      total PoE draw
+  SwOS RSTP           bridge/root bridge, port roles
+  SwOS LAG <n>        trunk members and partner
+  SwOS API            reachability and response time
+
+Configuration, one switch per run. Every option exists twice:
+  environment variable  SWOS_<OPTION>   (e.g. SWOS_HOST, SWOS_TEMP_WARN)
+  command-line option   --<option>      (e.g. --host, --temp-warn; underscores
+                                         become dashes, see --help)
+Command-line options win. Checkmk can only hand over command-line arguments, so
+the agent exports them into its own environment and reads everything from there.
+The address of the switch (host / SWOS_HOST) is required. Unset or empty values
+fall back to the GLOBAL SETTINGS just below.
+
+The password is --password (plain text; visible in the process list) or, on
+Checkmk >= 2.5, --password-id (a password-store reference, resolved here).
+SWOS_PASSWORD still works for standalone use.
+
+Test:    SWOS_HOST=192.168.88.2 SWOS_PASSWORD=secret ./agent_swos
+         ./agent_swos --host 192.168.88.2 --user admin --expected-up 1,49
+         ./agent_swos --host 192.168.88.2 --dump       raw decoded pages
+"""
+
+import argparse
+import json
+import math
+import os
+import re
+import socket
+import struct
+import sys
+import tempfile
+import time
+from types import SimpleNamespace
+
+# ==========================================================================
+# GLOBAL SETTINGS - edit here
+# ==========================================================================
+# Each option below can be overridden per switch with the environment variable
+# ENV_PREFIX + OPTION IN CAPITALS (e.g. SWOS_TEMP_WARN) or the command-line
+# option --option-name (e.g. --temp-warn). An unset or empty
+# variable falls back to the value in DEFAULTS, so anything that is the same for
+# all your switches (login, thresholds, ...) can simply be set here once.
+# All values are strings, exactly as they would arrive from the environment.
+
+ENV_PREFIX = "SWOS_"
+
+
+def _default_state_dir():
+    """Counter snapshots for rates. Same default as before, except that inside a
+    Checkmk site (where /var/lib/check_mk_agent is not writable) it is ~/var."""
+    if os.environ.get("MK_VARDIR"):
+        return os.path.join(os.environ["MK_VARDIR"], "mikrotik_swos")
+    if os.environ.get("OMD_ROOT"):
+        return os.path.join(os.environ["OMD_ROOT"], "var", "check_mk", "agent_swos")
+    return "/var/lib/check_mk_agent/mikrotik_swos"
+
+
+DEFAULTS = {
+    # --- connection ---------------------------------------------------------
+    "host": "",             # REQUIRED, set per switch: SWOS_HOST / --host
+    "user": "admin",        # SwOS factory login is admin with an empty password
+    "password": "",
+    "timeout": "10",        # HTTP timeout in seconds, per request
+    # Piggyback host name. Empty = output belongs to the host this script runs
+    # for; set a name to deliver it to another Checkmk host as piggyback data.
+    "piggyback": "",
+    # Where counter snapshots are kept to compute rates between runs
+    "state_dir": _default_state_dir(),
+
+    # --- what to monitor ----------------------------------------------------
+    # Groups: system,temp,fans,psu,ports,stats,sfp,poe,rstp,lag  ("all" = every group;
+    # "stats" = traffic/packet/error rates on the port services)
+    "checks": "all",
+    # Which ports get a service: "all" or e.g. "1-8,49-52" (also limits SFP services)
+    "ports": "all",
+
+    # --- ports --------------------------------------------------------------
+    # Ports that MUST be up (CRIT when down); all other down ports are OK
+    "expected_up": "",
+    # WARN if an expected-up port negotiates below this speed (Mbit/s), 0 = off
+    "min_speed": "0",
+    # WARN when a port logged at least this many new errors since the last run, 0 = off
+    "error_warn": "1",
+
+    # --- health -------------------------------------------------------------
+    "temp_warn": "75",      # CPU/board/PHY/PSU temperature, degrees C
+    "temp_crit": "90",
+    # The switch always reports fan1-4 / PSU1-2, even for slots that do not exist.
+    # Say how many are really installed so a failure becomes CRIT (0 = unknown,
+    # absent-looking fans/PSUs are then hidden).
+    "fan_count": "0",
+    "fan_min_rpm": "0",     # CRIT below this RPM, 0 = off
+    "psu_count": "0",
+    "psu_voltage_scale": "100",  # PSU voltage divisor (100 verified on CRS354)
+
+    # --- PoE ----------------------------------------------------------------
+    "poe": "auto",          # auto = use /poe.b if present, yes = require it, no = skip
+    "poe_total_warn": "",   # total PoE draw in watts, empty = no threshold
+    "poe_total_crit": "",
+
+    # --- SFP / QSFP modules ---------------------------------------------------
+    "sfp_temp_warn": "70",
+    "sfp_temp_crit": "85",
+    "sfp_rx_dbm_warn": "",  # WARN/CRIT when Rx power falls BELOW this (dBm), empty = off
+    "sfp_rx_dbm_crit": "",
+
+    # --- spanning tree ----------------------------------------------------------
+    "rstp_root": "",        # WARN if the root bridge is not this MAC, empty = off
+}
+
+# Options that can be given on the command line (the password has its own handling)
+OPTION_KEYS = [key for key in DEFAULTS if key != "password"]
+
+OK, WARN, CRIT, UNKNOWN = 0, 1, 2, 3
+
+ALL_CHECKS = ("system", "temp", "fans", "psu", "ports", "stats", "sfp", "poe",
+              "rstp", "lag")
+
+# --- enums, taken from the SwOS web UI (index.html) --------------------------
+# spd/spdc: "10M 100M 1G 10G 5G 2.5G 40G"; anything >= 7 means "no link"
+SPEED_MBIT = {0: 10, 1: 100, 2: 1000, 3: 10000, 4: 5000, 5: 2500, 6: 40000}
+POE_STATUS = {1: "disabled", 2: "waiting for load", 3: "powered on",
+              4: "overload", 5: "short circuit", 6: "voltage too low",
+              7: "current too low", 8: "power cycle", 9: "voltage too high",
+              10: "controller error"}
+POE_STATE = {"disabled": OK, "waiting for load": OK, "powered on": OK,
+             "current too low": OK, "power cycle": WARN,
+             "voltage too low": WARN, "voltage too high": WARN,
+             "overload": CRIT, "short circuit": CRIT, "controller error": CRIT}
+RSTP_ROLE = ["disabled", "alternate", "root", "designated", "backup"]
+RSTP_STATE = ["discarding", "learning", "forwarding", "forwarding"]  # lrn + 2*fwd
+FLOW_CTRL = ["off", "tx only", "rx only", "on"]                      # tfct + 2*rfct
+LACP_MODE = ["passive", "active", "static"]
+SFP_TYPE_HINTS = {"&mmf": "multi-mode fiber", "&smf": "single-mode fiber",
+                  "&f": "fiber"}
+
+# stats.b: 64-bit counters are split into a low word and a "...h" high word
+STATS_64 = {"rb": "rbh", "tb": "tbh", "rup": "ruph", "tup": "tuph",
+            "rbp": "rbph", "tbp": "tbph", "rmp": "rmph", "tmp": "tmph"}
+STATS_32 = ("rtp", "ttp", "rpp", "tpp", "rte", "rfcs", "rae", "rr", "fr",
+            "rov", "tur", "tlc", "tec", "tcl", "tmc", "tdf")
+RX_ERRORS = ("rte", "rfcs", "rae", "rr", "fr", "rov")
+TX_ERRORS = ("tur", "tlc", "tec")
+
+
+# --------------------------------------------------------------------------
+# Output helpers
+# --------------------------------------------------------------------------
+
+def num(value):
+    if isinstance(value, float):
+        return ("%.3f" % value).rstrip("0").rstrip(".") or "0"
+    return str(value)
+
+
+def metric(name, value, warn="", crit="", lo="", hi=""):
+    return "%s=%s;%s;%s;%s;%s" % (name, num(value), num(warn) if warn != "" else "",
+                                  num(crit) if crit != "" else "", lo, hi)
+
+
+def service(state, name, text, metrics=()):
+    """One Checkmk local-check line."""
+    perf = "|".join(metrics) if metrics else "-"
+    text = str(text).replace("\n", " ").replace("\r", " ")
+    return '%d "%s" %s %s' % (state, name.replace('"', "'"), perf, text)
+
+
+def fmt_duration(seconds):
+    seconds = int(seconds)
+    days, rest = divmod(seconds, 86400)
+    hours, rest = divmod(rest, 3600)
+    if days:
+        return "%dd %dh" % (days, hours)
+    return "%dh %dm" % (hours, rest // 60)
+
+
+def fmt_bps(bps):
+    for unit, div in (("Gbit/s", 1e9), ("Mbit/s", 1e6), ("kbit/s", 1e3)):
+        if bps >= div:
+            return "%.2f %s" % (bps / div, unit)
+    return "%d bit/s" % bps
+
+
+def fmt_speed(mbit):
+    return "%g Gbit/s" % (mbit / 1000.0) if mbit >= 1000 else "%d Mbit/s" % mbit
+
+
+def fmt_mac(raw):
+    raw = (raw or "").lower()
+    if len(raw) != 12:
+        return raw
+    return ":".join(raw[i:i + 2] for i in range(0, 12, 2))
+
+
+def hx(value):
+    return int(value, 16)
+
+
+def s32(value):
+    v = hx(value)
+    return v - 0x100000000 if v & 0x80000000 else v
+
+
+def ints(data, key):
+    return [hx(v) for v in data.get(key, [])]
+
+
+def text_of(value):
+    """SwOS strings are hex-encoded; tolerate non-ASCII and NUL padding."""
+    if not value:
+        return ""
+    try:
+        raw = bytes.fromhex(value)
+    except ValueError:
+        return str(value)
+    return raw.split(b"\0")[0].decode("latin-1").strip()
+
+
+def safe(func, default=""):
+    try:
+        return func()
+    except Exception:  # noqa: BLE001
+        return default
+
+
+def thr(value):
+    return "" if value is None else value
+
+
+def level(value, warn, crit, low=False):
+    """State for value vs thresholds; low=True alerts when value is BELOW."""
+    if value is None:
+        return OK
+    if low:
+        return CRIT if crit is not None and value < crit else \
+            WARN if warn is not None and value < warn else OK
+    return CRIT if crit is not None and value >= crit else \
+        WARN if warn is not None and value >= warn else OK
+
+
+# --------------------------------------------------------------------------
+# SwOS protocol: HTTP access, response parser, bit-field decoders
+# --------------------------------------------------------------------------
+
+# SwOS answers are JavaScript-like object literals, e.g.
+#   {en:[0x0fffffff,0xffffffff],nm:['506f7274'],prt:0x3c}
+# One regex pass turns them into JSON: keys get quoted, 'strings' become normal
+# strings and 0x.. numbers become *strings* ("0x3c", decoded with hx()). Because
+# strings are matched first and consumed whole, their content can never be
+# mistaken for a key or a number.
+_TOKEN = re.compile(r"'([^']*)'|(0x[0-9a-fA-F]+)|([A-Za-z_][A-Za-z0-9_]*)(?=:)")
+
+
+def parse_swos(text):
+    def repl(match):
+        if match.group(1) is not None:
+            return json.dumps(match.group(1))
+        return '"%s"' % (match.group(2) or match.group(3))
+    return json.loads(_TOKEN.sub(repl, text))
+
+
+def decode_flags(value):
+    """Bit field -> set of port numbers.
+
+    A single word covers ports 1-32. Switches with more ports send a list of
+    words, most significant first: [ports 33-64, ports 1-32]."""
+    words = value if isinstance(value, list) else [value]
+    ports = set()
+    for index, word in enumerate(reversed(words)):
+        bits, port = int(word, 16), 32 * index + 1
+        while bits:
+            if bits & 1:
+                ports.add(port)
+            bits >>= 1
+            port += 1
+    return ports
+
+
+def decode_ipv4(value):
+    ip = int(value, 16)
+    return socket.inet_ntoa(struct.pack("<L", ip)) if ip else ""
+
+
+class SwosClient(object):
+    """HTTP digest access to one switch; every page is fetched once per run."""
+
+    def __init__(self, host, user, password, timeout):
+        import requests
+        self._requests = requests
+        self.base = host if "://" in host else "http://%s" % host
+        self.auth = requests.auth.HTTPDigestAuth(user, password)
+        self.timeout = timeout
+        self._cache = {}
+
+    def get(self, page):
+        if page not in self._cache:
+            self._cache[page] = self._requests.get(
+                self.base + page, auth=self.auth, timeout=self.timeout)
+        return self._cache[page]
+
+    def get_json(self, page):
+        resp = self.get(page)
+        if resp.status_code == 401:
+            raise RuntimeError("HTTP 401 for %s: wrong user name or password" % page)
+        if resp.status_code != 200:
+            raise RuntimeError("HTTP %d for %s" % (resp.status_code, page))
+        return parse_swos(resp.text)
+
+
+# --------------------------------------------------------------------------
+# Context: everything fetched from one switch
+# --------------------------------------------------------------------------
+
+def fetch(c, page, required=False):
+    try:
+        return c.client.get_json(page)
+    except Exception:
+        if required:
+            raise
+        return None
+
+
+def flagset(c, data, key):
+    """Bit field -> set of port numbers (handles the 2-word form for >32 ports)."""
+    if not data or key not in data:
+        return set()
+    try:
+        return decode_flags(data[key])
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def build_context(sw):
+    client = SwosClient(sw["host"], sw["user"], sw["password"], sw["timeout"])
+    link = client.get_json("/link.b")
+    for key in ("prt", "lnk"):
+        if key not in link:
+            raise RuntimeError("link.b has no '%s' field (keys: %s) - run with "
+                               "--dump" % (key, ", ".join(sorted(link))))
+    c = SimpleNamespace(sw=sw, client=client, link=link, now=time.time(), notes=[],
+                        count=hx(link["prt"]),
+                        sfp_first_port=hx(link.get("sfpo", "0x0")) + 1)
+    want = sw["checks"]
+
+    def enabled(name):
+        return name in want
+
+    c.sys = fetch(c, "/sys.b", required=True)
+    c.poe = None
+    if enabled("poe") and sw["poe"] != "no":
+        c.poe = fetch(c, "/poe.b")
+        if c.poe is None and sw["poe"] == "yes":
+            raise RuntimeError("poe = yes, but /poe.b is not available")
+    c.stats = fetch(c, "/stats.b") if enabled("stats") else None
+    c.sfp = fetch(c, "/sfp.b") if enabled("sfp") else None
+    c.rstp = fetch(c, "/rstp.b") if enabled("rstp") else None
+    c.lacp = fetch(c, "/lacp.b") if enabled("lag") else None
+    c.enabled = enabled
+    c.names = [safe(lambda v=v: text_of(v)) for v in c.link.get("nm", [])]
+    c.up = flagset(c, c.link, "lnk")
+    return c
+
+
+def port_shown(c, n):
+    return c.sw["ports"] is None or n in c.sw["ports"]
+
+
+# --------------------------------------------------------------------------
+# Counter state (for rates). Local checks cannot compute rates themselves.
+# --------------------------------------------------------------------------
+
+def state_path(sw):
+    return os.path.join(sw["state_dir"],
+                        "%s.json" % re.sub(r"[^A-Za-z0-9_.-]", "_", sw["host"]))
+
+
+def load_state(sw):
+    try:
+        with open(state_path(sw)) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(sw, state):
+    try:
+        os.makedirs(sw["state_dir"], exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=sw["state_dir"])
+        with os.fdopen(fd, "w") as fh:
+            json.dump(state, fh)
+        os.replace(tmp, state_path(sw))
+        return True
+    except OSError:
+        return False
+
+
+def counter_delta(key, old, new):
+    if new >= old:
+        return new - old
+    if key not in STATS_64 and old >= 2 ** 31:   # 32-bit wrap
+        return new + 2 ** 32 - old
+    return None                                  # counters were reset
+
+
+def compute_rates(c):
+    """-> {port: {...rates...}} (empty on first run / unusable state)."""
+    st = c.stats
+    if not st:
+        return {}
+    current = {}
+    for n in range(1, c.count + 1):
+        entry = {}
+        for low, high in STATS_64.items():
+            if low in st and high in st and n <= len(st[low]) and n <= len(st[high]):
+                entry[low] = (hx(st[high][n - 1]) << 32) | hx(st[low][n - 1])
+        for key in STATS_32:
+            if key in st and n <= len(st[key]):
+                entry[key] = hx(st[key][n - 1])
+        current[str(n)] = entry
+
+    previous = load_state(c.sw)
+    if not save_state(c.sw, {"time": c.now, "ports": current}):
+        c.notes.append("state dir %s not writable, no rates" % c.sw["state_dir"])
+        return {}
+    if not previous:
+        return {}
+    dt = c.now - previous.get("time", 0)
+    if not 0 < dt <= 6 * 3600:
+        return {}
+
+    rates = {}
+    for n in range(1, c.count + 1):
+        old, new = previous["ports"].get(str(n)), current[str(n)]
+        if not old:
+            continue
+        d, bad = {}, False
+        for key, value in new.items():
+            if key in old:
+                delta = counter_delta(key, old[key], value)
+                if delta is None:
+                    bad = True
+                    break
+                d[key] = delta
+        if bad:
+            continue
+        rates[n] = {
+            "in_bps": d.get("rb", 0) * 8 / dt, "out_bps": d.get("tb", 0) * 8 / dt,
+            "in_pps": d.get("rtp", 0) / dt, "out_pps": d.get("ttp", 0) / dt,
+            "in_bcast": d.get("rbp", 0) / dt, "in_mcast": d.get("rmp", 0) / dt,
+            "in_errors": sum(d.get(k, 0) for k in RX_ERRORS) / dt,
+            "out_errors": sum(d.get(k, 0) for k in TX_ERRORS) / dt,
+            "error_count": sum(d.get(k, 0) for k in RX_ERRORS + TX_ERRORS),
+        }
+    return rates
+
+
+# --------------------------------------------------------------------------
+# System, health
+# --------------------------------------------------------------------------
+
+def system_lines(c):
+    s = c.sys
+    ip = safe(lambda: decode_ipv4(s.get("cip", s.get("ip"))), "")
+    bits = [safe(lambda: text_of(s["id"]), "?"),
+            safe(lambda: text_of(s["brd"]), "?"),
+            "SwOS " + safe(lambda: text_of(s["ver"]), "?")]
+    rev = safe(lambda: text_of(s.get("rev", "")), "")
+    if rev:
+        bits.append("rev " + rev)
+    bits.append("serial " + safe(lambda: text_of(s["sid"]), "?"))
+    if "mac" in s:
+        bits.append("MAC " + fmt_mac(s["mac"]))
+    if ip:
+        bits.append("IP " + ip)
+    if "bld" in s:
+        bits.append("build " + time.strftime("%Y-%m-%d", time.gmtime(hx(s["bld"]))))
+    bits.append("%d ports" % c.count)
+    metrics = []
+    if "upt" in s:                      # scale 100 per web UI
+        uptime = hx(s["upt"]) / 100.0
+        metrics.append(metric("uptime", uptime))
+        bits.append("up " + fmt_duration(uptime))
+    return [service(OK, "SwOS System", ", ".join(bits), metrics)]
+
+
+def temp_lines(c):
+    sw, s, lines = c.sw, c.sys, []
+    sensors = [("CPU", "temp", 1), ("Board 1", "btm1", 1), ("Board 2", "btm2", 1),
+               ("PHY", "phyt", 1), ("PSU1", "p1t", 10), ("PSU2", "p2t", 10)]
+    for label, key, scale in sensors:
+        if key not in s:
+            continue
+        value = s32(s[key]) / float(scale)
+        if value == 0 and key != "temp":     # absent sensors report 0
+            continue
+        lines.append(service(
+            level(value, sw["temp_warn"], sw["temp_crit"]),
+            "SwOS Temp %s" % label, "%.1f C" % value,
+            [metric("temp", value, thr(sw["temp_warn"]), thr(sw["temp_crit"]))]))
+    return lines
+
+
+def fan_lines(c):
+    sw, s, lines = c.sw, c.sys, []
+    for i in range(1, 5):
+        key = "fan%d" % i
+        if key not in s:
+            continue
+        rpm = hx(s[key])
+        expected = i <= sw["fan_count"]
+        if rpm == 0 and not expected:        # unknown whether the fan exists
+            continue
+        state, text = OK, "%d RPM" % rpm
+        if sw["fan_min_rpm"] and rpm < sw["fan_min_rpm"] and (expected or rpm):
+            state, text = CRIT, "%d RPM (below %d)" % (rpm, sw["fan_min_rpm"])
+        elif expected and rpm == 0:
+            state, text = CRIT, "stopped (0 RPM)"
+        lines.append(service(state, "SwOS Fan %d" % i, text, [metric("fan", rpm, lo=0)]))
+    return lines
+
+
+def psu_lines(c):
+    sw, s, lines = c.sw, c.sys, []
+    for i in (1, 2):
+        status_key = "p%ds" % i
+        if status_key not in s:
+            continue
+        ok = hx(s[status_key]) == 1
+        volt = hx(s.get("p%dv" % i, "0x0")) / sw["psu_voltage_scale"]
+        expected = i <= sw["psu_count"]
+        if not ok and volt == 0 and not expected:
+            continue                          # PSU slot not populated
+        bits, metrics = [], []
+        bits.append("ok" if ok else "FAILED")
+        if volt:
+            bits.append("%.2f V" % volt)
+            metrics.append(metric("voltage", volt))
+        if "p%dc" % i in s:
+            cur = hx(s["p%dc" % i])
+            if cur:
+                bits.append("%d mA" % cur)
+                metrics.append(metric("current", cur / 1000.0))
+        if "p%dp" % i in s and hx(s["p%dp" % i]):
+            power = hx(s["p%dp" % i]) / 10.0
+            bits.append("%.1f W" % power)
+            metrics.append(metric("power", power))
+        if "p%df" % i in s and hx(s["p%df" % i]):
+            bits.append("fan %d RPM" % hx(s["p%df" % i]))
+        lines.append(service(OK if ok else CRIT, "SwOS PSU %d" % i, ", ".join(bits), metrics))
+    return lines
+
+
+# --------------------------------------------------------------------------
+# PoE
+# --------------------------------------------------------------------------
+
+def poe_readings(c):
+    d, readings = c.poe, {}
+    for i in range(len(d.get("poe", []))):
+        status = POE_STATUS.get(hx(d["poes"][i]), "unknown (0x%02x)" % hx(d["poes"][i]))
+        readings[i + 1] = {            # PoE entry i belongs to port i+1
+            "status": status,
+            "state": POE_STATE.get(status, WARN),
+            "current_ma": hx(d["curr"][i]),
+            "voltage_v": hx(d["volt"][i]) / 10.0,
+            "power_w": hx(d["pwr"][i]) / 10.0,
+        }
+    return readings
+
+
+def poe_total_line(c, readings):
+    sw = c.sw
+    total = sum(p["power_w"] for p in readings.values())
+    active = sum(1 for p in readings.values() if p["status"] == "powered on")
+    return service(
+        level(total, sw["poe_total_warn"], sw["poe_total_crit"]), "SwOS PoE Total",
+        "%.1f W across %d powered ports" % (total, active),
+        [metric("poe_power_total", total, thr(sw["poe_total_warn"]),
+                thr(sw["poe_total_crit"]), 0)])
+
+
+# --------------------------------------------------------------------------
+# Ports
+# --------------------------------------------------------------------------
+
+def port_lines(c, poe, rates):
+    sw, d, lines = c.sw, c.link, []
+    paused, full = flagset(c, d, "paus"), flagset(c, d, "dpx")
+    tfct, rfct = flagset(c, d, "tfct"), flagset(c, d, "rfct")
+    enabled, qsfp = flagset(c, d, "en"), flagset(c, d, "qsfp")
+    spd = ints(d, "spd")
+
+    rstp = c.rstp or {}
+    r_ena, r_fwd, r_lrn = (flagset(c, rstp, k) for k in ("ena", "fwd", "lrn"))
+    r_role = ints(rstp, "role")
+    lacp = c.lacp or {}
+    l_mode, l_grp = ints(lacp, "mode"), ints(lacp, "grp")
+
+    for n in range(1, c.count + 1):
+        if not port_shown(c, n):
+            continue
+        i = n - 1
+        name = c.names[i] if i < len(c.names) else ""
+        expected = n in sw["expected_up"]
+        up = n in c.up
+        speed = SPEED_MBIT.get(spd[i]) if up and i < len(spd) else None
+
+        state, parts, metrics = OK, [], []
+        if up:
+            text = "up"
+            if speed:
+                text += ", " + fmt_speed(speed)
+                metrics.append(metric("speed", speed))
+            if n in paused:
+                text += ", PAUSED"
+                state = max(state, WARN)
+            if n in full:
+                text += ", full duplex"
+            else:
+                text += ", HALF DUPLEX"
+                state = max(state, WARN)
+            fc = FLOW_CTRL[(n in tfct) + 2 * (n in rfct)]
+            if fc != "off":
+                text += ", flow ctrl " + fc
+            if expected and sw["min_speed"] and speed and speed < sw["min_speed"]:
+                state = max(state, WARN)
+                text += " (expected >= %d Mbit/s)" % sw["min_speed"]
+            parts.append(text)
+        else:
+            text = "down" if n in enabled else "down (administratively disabled)"
+            if expected:
+                state = CRIT
+                text += " (expected up)"
+            parts.append(text)
+        if n in qsfp:
+            parts[0] += " [QSFP]"
+
+        # RSTP role/state (only meaningful for linked ports with RSTP on)
+        if up and n in r_ena and i < len(r_role):
+            role = RSTP_ROLE[r_role[i]] if r_role[i] < len(RSTP_ROLE) else "?"
+            rstate = RSTP_STATE[(n in r_lrn) + 2 * (n in r_fwd)]
+            parts.append("RSTP %s/%s" % (role, rstate))
+
+        # LACP
+        if i < len(l_mode) and l_mode[i] in (1, 2):
+            if i < len(l_grp) and l_grp[i]:
+                parts.append("LAG %d (%s)" % (l_grp[i], LACP_MODE[l_mode[i]]))
+            elif up:
+                parts.append("LACP %s but NOT bundled" % LACP_MODE[l_mode[i]])
+                state = max(state, WARN)
+
+        # PoE
+        p = poe.get(n)
+        if p:
+            state = max(state, p["state"])
+            if p["status"] != "waiting for load":
+                t = "PoE " + p["status"]
+                if p["status"] == "powered on" or p["power_w"] > 0:
+                    t += ", %.1f W" % p["power_w"]
+                parts.append(t)
+            if p["status"] == "powered on" or p["power_w"] > 0:
+                metrics += [metric("poe_power", p["power_w"], lo=0),
+                            metric("poe_current", p["current_ma"], lo=0),
+                            metric("poe_voltage", p["voltage_v"], lo=0)]
+
+        # Traffic / errors
+        r = rates.get(n)
+        if r:
+            if up or r["in_bps"] or r["out_bps"]:
+                parts.append("in %s, out %s" % (fmt_bps(r["in_bps"]), fmt_bps(r["out_bps"])))
+            metrics += [
+                metric("if_in_bps", r["in_bps"], lo=0), metric("if_out_bps", r["out_bps"], lo=0),
+                metric("if_in_pkts", r["in_pps"], lo=0), metric("if_out_pkts", r["out_pps"], lo=0),
+                metric("if_in_bcast", r["in_bcast"], lo=0), metric("if_in_mcast", r["in_mcast"], lo=0),
+                metric("if_in_errors", r["in_errors"], lo=0), metric("if_out_errors", r["out_errors"], lo=0),
+            ]
+            if sw["error_warn"] and r["error_count"] >= sw["error_warn"]:
+                state = max(state, WARN)
+                parts.append("%d new errors" % r["error_count"])
+
+        label = "%s: " % name if name else ""
+        lines.append(service(state, "SwOS Port %02d" % n, label + ", ".join(parts), metrics))
+    return lines
+
+
+# --------------------------------------------------------------------------
+# SFP / QSFP modules
+# --------------------------------------------------------------------------
+
+def dbm(raw):
+    """Power in 0.1 uW units (UI scale 1e4) -> dBm; 0 = not available."""
+    return 10.0 * math.log10(raw / 1e4) if raw > 0 else None
+
+
+def sfp_lines(c):
+    sw, d, lines = c.sw, c.sfp, []
+    if not d or "vnd" not in d:
+        return lines
+    for j in range(len(d["vnd"])):
+        port = c.sfp_first_port + j
+        vendor = text_of(d["vnd"][j])
+        if not vendor or not port_shown(c, port):
+            continue                         # no module inserted
+        part, serial = text_of(d["pnr"][j]), text_of(d["ser"][j])
+        mtype = text_of(d["typ"][j])
+        for hint, long_name in SFP_TYPE_HINTS.items():
+            mtype = mtype.replace(hint, long_name)
+        bits = ["%s %s" % (vendor, part)]
+        if mtype:
+            bits.append(mtype)
+        bits.append("serial " + serial)
+        date = text_of(d["dat"][j])
+        if date:
+            bits.append("date " + date)
+
+        state, metrics = OK, []
+        tmp = s32(d["tmp"][j]) if "tmp" in d else -128
+        if tmp != -128:                       # -128 = not available
+            bits.append("%d C" % tmp)
+            metrics.append(metric("temp", tmp, thr(sw["sfp_temp_warn"]), thr(sw["sfp_temp_crit"])))
+            state = max(state, level(tmp, sw["sfp_temp_warn"], sw["sfp_temp_crit"]))
+        vcc = hx(d["vcc"][j]) if "vcc" in d else 0
+        if vcc:
+            bits.append("%.2f V" % (vcc / 1000.0))
+            metrics.append(metric("voltage", vcc / 1000.0))
+        bias = hx(d["tbs"][j]) if "tbs" in d else 0
+        if bias:
+            bits.append("Tx bias %d mA" % bias)
+            metrics.append(metric("tx_bias_ma", bias))
+        tx = dbm(hx(d["tpw"][j])) if "tpw" in d else None
+        rx = dbm(hx(d["rpw"][j])) if "rpw" in d else None
+        if tx is not None:
+            bits.append("Tx %.1f dBm" % tx)
+            metrics.append(metric("output_signal_power_dbm", tx))
+        if rx is not None:
+            bits.append("Rx %.1f dBm" % rx)
+            metrics.append(metric("input_signal_power_dbm", rx,
+                                  thr(sw["sfp_rx_dbm_warn"]), thr(sw["sfp_rx_dbm_crit"])))
+            state = max(state, level(rx, sw["sfp_rx_dbm_warn"], sw["sfp_rx_dbm_crit"], low=True))
+        wln = hx(d["wln"][j]) if "wln" in d else 0
+        if wln:
+            bits.append("%g nm" % (wln / 100.0))
+        lines.append(service(state, "SwOS SFP %02d" % port, ", ".join(bits), metrics))
+    return lines
+
+
+# --------------------------------------------------------------------------
+# RSTP and LAG
+# --------------------------------------------------------------------------
+
+def rstp_lines(c):
+    s, sw = c.sys, c.sw
+    if not c.rstp or "prio" not in s or "rmac" not in s:
+        return []
+    own, root = s["mac"].lower(), s["rmac"].lower()
+    prio, rprio = hx(s["prio"]), hx(s.get("rpr", s["prio"]))
+    is_root = own == root and prio == rprio
+
+    role_count, forwarding = {}, 0
+    ena, fwd, lrn = (flagset(c, c.rstp, k) for k in ("ena", "fwd", "lrn"))
+    roles = ints(c.rstp, "role")
+    for n in c.up & ena:
+        if n - 1 < len(roles) and roles[n - 1] < len(RSTP_ROLE):
+            name = RSTP_ROLE[roles[n - 1]]
+            role_count[name] = role_count.get(name, 0) + 1
+        if n in fwd:
+            forwarding += 1
+
+    state = OK
+    text = "bridge %04x.%s, root %04x.%s (%s)" % (
+        prio, fmt_mac(own), rprio, fmt_mac(root), "this switch" if is_root else "other bridge")
+    expected = sw["rstp_root"]
+    if expected and expected != root:
+        state = WARN
+        text += ", EXPECTED ROOT %s" % fmt_mac(expected)
+    if role_count:
+        text += ", ports: " + ", ".join("%d %s" % (v, k) for k, v in sorted(role_count.items()))
+    text += ", %d forwarding" % forwarding
+    return [service(state, "SwOS RSTP", text,
+                    [metric("rstp_ports_forwarding", forwarding, lo=0)])]
+
+
+def lag_lines(c):
+    d = c.lacp
+    if not d or "mode" not in d:
+        return []
+    modes, grp, sgrp = ints(d, "mode"), ints(d, "grp"), ints(d, "sgrp")
+    macs = d.get("mac", [])
+    groups = {}
+    for i in range(c.count):
+        n = i + 1
+        g = grp[i] if i < len(grp) else 0
+        if g:
+            e = groups.setdefault(g, {"live": set(), "static": set(), "partners": set()})
+            e["live"].add(n)
+            mac = macs[i] if i < len(macs) else ""
+            if mac and set(mac) != {"0"}:
+                e["partners"].add(fmt_mac(mac))
+        if i < len(modes) and modes[i] == 2 and i < len(sgrp) and sgrp[i]:
+            groups.setdefault(sgrp[i], {"live": set(), "static": set(),
+                                        "partners": set()})["static"].add(n)
+    lines = []
+    for g in sorted(groups):
+        e = groups[g]
+        members = sorted(e["live"] | e["static"])
+        up = [m for m in members if m in c.up]
+        state = OK
+        if e["static"] and len(up) < len(e["static"]):
+            state = CRIT if not up else WARN
+        text = "members %s, %d/%d up" % (",".join(map(str, members)), len(up), len(members))
+        if e["partners"]:
+            text += ", partner " + ",".join(sorted(e["partners"]))
+        lines.append(service(state, "SwOS LAG %d" % g, text,
+                             [metric("lag_members_up", len(up), lo=0, hi=len(members))]))
+    return lines
+
+
+# --------------------------------------------------------------------------
+# One switch
+# --------------------------------------------------------------------------
+
+def collect(sw):
+    started = time.time()
+    c = build_context(sw)
+    on = c.enabled
+
+    poe = poe_readings(c) if c.poe else {}
+    rates = compute_rates(c) if c.stats else {}
+
+    lines = []
+    if on("system"):
+        lines += system_lines(c)
+    if on("temp"):
+        lines += temp_lines(c)
+    if on("fans"):
+        lines += fan_lines(c)
+    if on("psu"):
+        lines += psu_lines(c)
+    if on("ports"):
+        lines += port_lines(c, poe, rates)
+    if on("sfp"):
+        lines += sfp_lines(c)
+    if poe:
+        lines.append(poe_total_line(c, poe))
+    if on("rstp"):
+        lines += rstp_lines(c)
+    if on("lag"):
+        lines += lag_lines(c)
+
+    elapsed = time.time() - started
+    text = "Reachable, %.2fs" % elapsed
+    if c.notes:
+        text += " (%s)" % "; ".join(c.notes)
+    lines.append(service(WARN if c.notes else OK, "SwOS API", text,
+                         [metric("response_time", elapsed, lo=0)]))
+    return lines
+
+
+def run_switch(sw):
+    try:
+        return collect(sw)
+    except Exception as exc:  # noqa: BLE001 - the agent must always emit something
+        msg = "cannot query %s: %s: %s" % (sw["host"], type(exc).__name__, exc)
+    return [service(CRIT, "SwOS API", msg)]
+
+
+# --------------------------------------------------------------------------
+# Settings (environment) / CLI
+# --------------------------------------------------------------------------
+
+def parse_ports(value):
+    ports = set()
+    for part in (value or "").replace(" ", "").split(","):
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            ports.update(range(int(a), int(b) + 1))
+        else:
+            ports.add(int(part))
+    return ports
+
+
+def opt_float(value):
+    return float(value) if value not in (None, "") else None
+
+
+def setting(key):
+    """SWOS_<KEY> from the environment; unset/empty falls back to DEFAULTS."""
+    raw = os.environ.get(ENV_PREFIX + key.upper())
+    if key == "password":                    # keep whitespace in passwords
+        return DEFAULTS[key] if raw is None else raw
+    if raw is None or not raw.strip():
+        return DEFAULTS[key]
+    return raw.strip()
+
+
+def convert(key, func):
+    value = setting(key)
+    try:
+        return func(value)
+    except ValueError:
+        sys.exit("Invalid value %r for --%s (environment variable %s%s)"
+                 % (value, key.replace("_", "-"), ENV_PREFIX, key.upper()))
+
+
+def load_settings():
+    host = setting("host")
+    if not host:
+        sys.exit("No switch address: set %sHOST or pass --host (address or host name)"
+                 % ENV_PREFIX)
+    ports = setting("ports").lower()
+    checks = [x for x in setting("checks").lower().replace(" ", "").split(",") if x]
+    checks = list(ALL_CHECKS) if not checks or "all" in checks else \
+        [x for x in checks if x in ALL_CHECKS]
+    poe = setting("poe").lower()
+    return {
+        "host": host,
+        "user": setting("user"),
+        "password": setting("password"),
+        "timeout": convert("timeout", lambda v: int(v or 10)),
+        "piggyback": setting("piggyback"),
+        "state_dir": setting("state_dir"),
+        "ports": None if ports in ("", "all") else convert("ports", parse_ports),
+        "expected_up": convert("expected_up", parse_ports),
+        "min_speed": convert("min_speed", lambda v: int(v or 0)),
+        "checks": checks,
+        "poe": poe if poe in ("auto", "yes", "no") else "auto",
+        "poe_total_warn": convert("poe_total_warn", opt_float),
+        "poe_total_crit": convert("poe_total_crit", opt_float),
+        "temp_warn": convert("temp_warn", opt_float),
+        "temp_crit": convert("temp_crit", opt_float),
+        "sfp_temp_warn": convert("sfp_temp_warn", opt_float),
+        "sfp_temp_crit": convert("sfp_temp_crit", opt_float),
+        "sfp_rx_dbm_warn": convert("sfp_rx_dbm_warn", opt_float),
+        "sfp_rx_dbm_crit": convert("sfp_rx_dbm_crit", opt_float),
+        "error_warn": convert("error_warn", lambda v: int(v or 0)),
+        "fan_count": convert("fan_count", lambda v: int(v or 0)),
+        "fan_min_rpm": convert("fan_min_rpm", lambda v: int(v or 0)),
+        "psu_count": convert("psu_count", lambda v: int(v or 0)),
+        "psu_voltage_scale": convert("psu_voltage_scale", lambda v: float(v or 100)),
+        "rstp_root": setting("rstp_root").lower().replace(":", "").replace("-", ""),
+    }
+
+
+DUMP_PAGES = ("sys.b", "link.b", "stats.b", "poe.b", "sfp.b", "rstp.b", "lacp.b",
+              "fwd.b", "vlan.b", "snmp.b", "fan.b", "host.b", "acl.b")
+
+
+def dump(sw):
+    client = SwosClient(sw["host"], sw["user"], sw["password"], sw["timeout"])
+    for page in DUMP_PAGES:
+        print("=== /%s ===" % page)
+        try:
+            resp = client.get("/" + page)
+            try:
+                print(json.dumps(parse_swos(resp.text), indent=1))
+            except ValueError:
+                print("HTTP %d, not parseable:\n%s" % (resp.status_code, resp.text[:500]))
+        except Exception as exc:  # noqa: BLE001
+            print("error: %s" % exc)
+
+
+def add_password_options(ap):
+    """--password, plus --password-id when Checkmk's password store API exists.
+
+    Returns True if the store API is available (Checkmk >= 2.5.0). Without it
+    (older Checkmk or standalone use) only the plain --password is offered."""
+    try:
+        from cmk.password_store.v1_unstable import parser_add_secret_option
+    except ImportError:
+        ap.add_argument("--password", metavar="PASSWORD",
+                        help="password of the switch (plain text; or use SWOS_PASSWORD)")
+        return False
+    parser_add_secret_option(ap, long="--password", required=False,
+                             help="password of the switch")
+    return True
+
+
+def resolve_password(args, store_api):
+    if store_api and (getattr(args, "password", None) or getattr(args, "password_id", None)):
+        from cmk.password_store.v1_unstable import resolve_secret_option
+        return resolve_secret_option(args, "password").reveal()
+    return getattr(args, "password", None)
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        description=__doc__.split("\n")[1], allow_abbrev=False,
+        epilog="Every option can also be set as environment variable "
+               "%s<OPTION>; command-line options take precedence." % ENV_PREFIX)
+    ap.add_argument("--dump", action="store_true",
+                    help="print the raw decoded pages of the switch and exit")
+    for key in OPTION_KEYS:
+        ap.add_argument("--" + key.replace("_", "-"), dest=key, metavar="VALUE",
+                        help="same as environment variable %s%s" % (ENV_PREFIX, key.upper()))
+    store_api = add_password_options(ap)
+    args = ap.parse_args()
+
+    # Checkmk can only hand over command-line arguments (no environment), so they
+    # are exported here and everything below keeps reading the environment.
+    for key in OPTION_KEYS:
+        value = getattr(args, key)
+        if value is not None:
+            os.environ[ENV_PREFIX + key.upper()] = value
+    password = resolve_password(args, store_api)
+    if password is not None:
+        os.environ[ENV_PREFIX + "PASSWORD"] = password
+
+    sw = load_settings()
+    if args.dump:
+        dump(sw)
+        return
+
+    out = []
+    if sw["piggyback"]:
+        out.append("<<<<%s>>>>" % sw["piggyback"])
+    out.append("<<<local:sep(0)>>>")
+    out.extend(run_switch(sw))
+    if sw["piggyback"]:
+        out.append("<<<<>>>>")
+    print("\n".join(out))
+
+
+if __name__ == "__main__":
+    main()
