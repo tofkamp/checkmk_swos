@@ -25,3 +25,8 @@ Actively used in production with the following models:
 
 - CRS354-48P-4S\+2Q\+
 - CRS326-24S\+2Q\+
+
+
+
+Website = https://github.com/tofkamp/checkmk_swos/
+Icon = Router 
