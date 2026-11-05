@@ -1,6 +1,4 @@
-Monitor Mikrotik SwitchOS/SwOS routers
-
-Querying the web interface of the device to monitor:
+Monitor Mikrotik SwitchOS routers by querying the web interface of the device:
 
 - System information and uptime
 - Temperatures
