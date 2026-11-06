@@ -20,7 +20,13 @@ Install the `.mkp` file via **Setup → Extension packages** or via the CLI:
 ```
 mkp install swos-<version>.mkp
 ```
-
+Alternative install
+```
+sudo bash
+su monitoring     # su <sitename>
+cd ~/local/lib/python3/cmk_addons/plugins
+tar xvf /tmp/swos_checkmk_plugin.tar.gz
+```
 After installation, configure the special agent under
 **Setup → Other integrations → MikroTik SwOS** and assign it to your
 MikroTik hosts.
